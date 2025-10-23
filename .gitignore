@@ -59,3 +59,7 @@ CS 279_Project-v4.pdf
 .env
 .env.local
 .env.production
+.env.*
+
+# Railway specific
+.railway/
