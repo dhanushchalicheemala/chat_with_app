@@ -154,7 +154,7 @@ def execute_sql_query(sql_query: str) -> str:
         return result_text
 
     except Exception as e:
-        return f"Database error: {e}"
+        return f"Database connection error: {e}. Please check if the database is properly configured and the counties table exists."
 
 @tool
 def get_database_schema() -> str:
