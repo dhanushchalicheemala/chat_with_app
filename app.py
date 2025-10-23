@@ -9,6 +9,7 @@ import subprocess
 import psycopg2
 import json
 import requests
+import os
 from typing import Tuple, List, Optional, Dict, Any
 from langchain_core.tools import tool
 from langchain_community.llms import Ollama
@@ -16,17 +17,17 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
-# Database configuration
+# Database configuration - Railway will provide these as environment variables
 DB_PARAMS = {
-    'dbname': 'USCountyDB',
-    'user': 'dhanush',
-    'password': '',
-    'host': 'localhost',
-    'port': 5432
+    'dbname': os.getenv('PGDATABASE', 'USCountyDB'),
+    'user': os.getenv('PGUSER', 'dhanush'),
+    'password': os.getenv('PGPASSWORD', ''),
+    'host': os.getenv('PGHOST', 'localhost'),
+    'port': int(os.getenv('PGPORT', 5432))
 }
 
-# Ollama configuration
-OLLAMA_BASE_URL = "http://localhost:11434"
+# Ollama configuration - Railway service URL
+OLLAMA_BASE_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434')
 MODEL_NAME = "llama3.2:3b"
 
 # Schema information for the LLM
