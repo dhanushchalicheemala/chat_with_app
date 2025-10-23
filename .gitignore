@@ -49,6 +49,9 @@ Thumbs.db
 # Large data files
 TIGER2018_COUNTY_with_state.csv
 
+# Project documentation
+CS 279_Project-v4.pdf
+
 # Logs
 *.log
 
