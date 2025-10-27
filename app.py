@@ -40,19 +40,24 @@ Columns:
 - state_abbr (state code like 'CA')
 - aland (land area in square meters)
 - awater (water area in square meters)
-- geom (geometry - use ST_Area(geom::geography)/1000000 for km²)
+- geom (geometry column - already populated)
 - intptlat, intptlon (latitude and longitude of center point)
 
-Important functions:
+CRITICAL RULES:
+- DO NOT create new geometry objects with ST_GeomFromText or ST_MakePoint
+- DO NOT use ST_Touches, ST_Contains with hand-written geometry
+- DO use the existing geom column for spatial operations
+- For spatial queries, use the geom column that already exists in the table
+
+Important functions (use on existing geom column):
 - ST_Area(geom::geography)/1000000 for area in km²
 - ST_Distance(geom1::geography, geom2::geography)/1000 for distance in km
-- ST_Touches(geom1, geom2) to find neighboring counties
-- ST_Contains(geom1, geom2) for containment
 
 Example queries:
 - SELECT COUNT(*) FROM counties WHERE state_name = 'California';
-- SELECT name, ST_Area(geom_4326::geography)/1000000 as area_km2 FROM counties ORDER BY area_km2 DESC LIMIT 5;
-- For spatial operations, use geom_4326 (SRID 4326) for compatibility with geography functions
+- SELECT name, ST_Area(geom::geography)/1000000 as area_km2 FROM counties ORDER BY area_km2 DESC LIMIT 5;
+- SELECT name, state_name FROM counties WHERE state_abbr = 'TX';
+- DO NOT create new geometry - only use existing geom column
 """
 
 # =============================================================================
@@ -145,6 +150,17 @@ def execute_sql_query(sql_query: str) -> str:
         A formatted string with the query results
     """
     try:
+        # Validate SQL - check for dangerous patterns
+        sql_upper = sql_query.upper()
+        
+        # Reject queries that try to create geometry
+        if 'ST_GEOMFROMTEXT' in sql_upper or 'ST_MAKEPOINT' in sql_upper:
+            return f"Error: Cannot create new geometry objects. Please use the existing geom column instead.\n\nGenerated SQL:\n{sql_query}"
+        
+        # Check for unterminated strings
+        if sql_query.count("'") % 2 != 0:
+            return f"Error: Invalid SQL with unterminated string. Please try rephrasing your question.\n\nGenerated SQL:\n{sql_query}"
+        
         conn = psycopg2.connect(**DB_PARAMS)
         cur = conn.cursor()
 
