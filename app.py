@@ -77,31 +77,58 @@ def convert_nl_to_sql(question: str) -> str:
     Generate ONLY the PostgreSQL SQL query, no explanation:"""
 
     try:
-        # Try Ollama first (if available)
-        if os.getenv('OLLAMA_URL'):
-            try:
-                result = subprocess.run(
-                    ['ollama', 'run', MODEL_NAME, prompt],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                sql = result.stdout.strip()
+        # Try Ollama via HTTP API (for Railway deployment)
+        ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
+        
+        try:
+            response = requests.post(
+                f"{ollama_url}/api/generate",
+                json={
+                    "model": MODEL_NAME,
+                    "prompt": prompt,
+                    "stream": False
+                },
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                sql = result.get('response', '').strip()
+                # Clean up markdown formatting
                 sql = sql.replace('```sql', '').replace('```', '').strip()
-                return sql
-            except:
-                pass
+                if sql:
+                    return sql
+        except Exception as e:
+            st.warning(f"Ollama not available: {e}")
         
         # Fallback to OpenAI if Ollama is not available
-        if os.getenv('OPENAI_API_KEY'):
-            llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
-            response = llm.invoke(prompt)
-            sql = response.content.strip()
-            sql = sql.replace('```sql', '').replace('```', '').strip()
-            return sql
+        openai_key = os.getenv('OPENAI_API_KEY')
+        if openai_key:
+            try:
+                llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0, api_key=openai_key)
+                response = llm.invoke(prompt)
+                sql = response.content.strip()
+                sql = sql.replace('```sql', '').replace('```', '').strip()
+                if sql:
+                    return sql
+            except Exception as e:
+                st.warning(f"OpenAI API error: {e}")
         
-        # Final fallback - return a simple query
-        return "SELECT COUNT(*) FROM counties LIMIT 1;"
+        # Final fallback - generate a basic query based on the question
+        question_lower = question.lower()
+        if 'count' in question_lower or 'how many' in question_lower:
+            if 'california' in question_lower or 'ca' in question_lower:
+                return "SELECT COUNT(*) FROM counties WHERE state_name = 'California'"
+            elif 'texas' in question_lower or 'tx' in question_lower:
+                return "SELECT COUNT(*) FROM counties WHERE state_name = 'Texas'"
+            else:
+                return "SELECT COUNT(*) FROM counties"
+        elif 'largest' in question_lower or 'biggest' in question_lower:
+            return "SELECT name, state_name, ST_Area(geom::geography)/1000000 as area_km2 FROM counties ORDER BY area_km2 DESC LIMIT 5"
+        elif 'smallest' in question_lower:
+            return "SELECT name, state_name, ST_Area(geom::geography)/1000000 as area_km2 FROM counties WHERE ST_Area(geom::geography) > 0 ORDER BY area_km2 ASC LIMIT 5"
+        else:
+            return "SELECT name, state_name FROM counties LIMIT 10"
 
     except Exception as e:
         return f"SELECT COUNT(*) FROM counties LIMIT 1;"
