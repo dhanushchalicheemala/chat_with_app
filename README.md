@@ -2,6 +2,8 @@
 
 **Chat with the Map** is a Streamlit application that lets you ask natural‑language questions about U.S. counties and see results both as text and on an interactive map.
 
+![Chat with the Map demo](Untitled%20design%20(1).gif)
+
 Under the hood, it:
 - **Converts natural language to SQL** using a LangGraph / LangChain ReAct-style agent
 - **Queries a PostGIS database** containing all U.S. counties (TIGER 2018 data)
