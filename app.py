@@ -4,6 +4,10 @@ Chat with the Map - Streamlit Application with LangGraph ReAct Agent
 Natural Language Interface for US Counties PostGIS Database
 """
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 import streamlit as st
 import subprocess
 import psycopg2
@@ -14,7 +18,8 @@ import re
 import pydeck as pdk
 from typing import Tuple, List, Optional, Dict, Any
 from langchain_core.tools import tool
-from langchain_community.llms import Ollama
+# from langchain_community.llms import Ollama # Deprecated
+from langchain_ollama import OllamaLLM as Ollama # New import
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
@@ -79,6 +84,7 @@ Spatial Functions Available:
 - ST_Intersects(geom1, geom2) -- Returns true if geometries intersect
 - ST_Centroid(geom) -- Returns center point
 - ST_Union(geom1, geom2) -- Combines geometries
+- ST_AsGeoJSON(geom) -- Returns GeoJSON representation
 
 Notes:
 - Use ::geography for accurate area/distance calculations
@@ -94,6 +100,19 @@ CRITICAL RULES:
 - DO NOT use JOINs with other tables - there is ONLY the counties table
 - For "counties in [state]" questions, use WHERE state_name = '[State]' or WHERE state_abbr = '[XX]' - DO NOT use ST_Within or ST_Contains
 - DO NOT try to JOIN with a states table - use state_name/state_abbr columns directly from counties table
+- DO NOT try to JOIN with a states table - use state_name/state_abbr columns directly from counties table
+- Use ILIKE for string comparisons to be case-insensitive (e.g. state_name ILIKE 'california')
+
+IMPORTANT: BORDER/NEIGHBOR QUERIES
+- If the user asks for "bordering", "adjacent", "next to", "neighbors" of a county:
+- YOU MUST USE A SELF-JOIN on the counties table!
+- Pattern: SELECT c2.name, c2.state_name, ... FROM counties c1, counties c2 WHERE c1.name ILIKE '[Target County]' AND ST_Touches(c1.geom, c2.geom) AND c1.id != c2.id
+- DO NOT create geometries with ST_GeomFromText - use the existing geom column!
+
+IMPORTANT: MAP VISUALIZATION
+- If the user asks to "show", "map", "visualize", or "display", YOU MUST SELECT GEOMETRY COLUMNS!
+- Include: ST_AsGeoJSON(geom) as geom_geojson, ST_Y(ST_Centroid(geom)) as centroid_lat, ST_X(ST_Centroid(geom)) as centroid_lon
+- Example: SELECT name, state_name, ST_AsGeoJSON(geom) as geom_geojson, ST_Y(ST_Centroid(geom)) as centroid_lat, ST_X(ST_Centroid(geom)) as centroid_lon FROM counties WHERE ...
 
 IMPORTANT: AGGREGATION FUNCTIONS
 - When question asks for "total", "sum", "combined", "all together" → USE SUM() aggregation
@@ -104,52 +123,129 @@ IMPORTANT: AGGREGATION FUNCTIONS
 - CRITICAL: For "total area" questions, you MUST use SUM(ST_Area(...)) NOT just ST_Area(...)
 - CRITICAL: When using SUM(), AVG(), etc., do NOT select individual rows - return a single aggregated result
 
-Spatial Functions (use on existing geom column):
-- ST_Area(geom::geography)/1000000 for area in km²
-- ST_Distance(geom1::geography, geom2::geography)/1000 for distance in km
-- ST_Touches(geom1, geom2) for checking if geometries touch/border each other
-- ST_Intersects(geom1, geom2) for checking if geometries intersect
+EXAMPLE QUERIES (24 COMPREHENSIVE PATTERNS):
 
-EXAMPLE QUERIES:
+-- BASIC QUERIES --
+1. County in specific state - "Show me Madison County, Idaho":
+   SELECT name, state_name, ST_AsGeoJSON(geom) as geom_geojson, ST_Y(ST_Centroid(geom)) as centroid_lat, ST_X(ST_Centroid(geom)) as centroid_lon
+   FROM counties WHERE name ILIKE 'Madison' AND state_name ILIKE 'Idaho';
 
-1. Count queries:
-   SELECT COUNT(*) FROM counties WHERE state_name = 'California';
+2. County name across all states - "Visualize Madison County in all states":
+   SELECT name, state_name, ST_AsGeoJSON(geom) as geom_geojson, ST_Y(ST_Centroid(geom)) as centroid_lat, ST_X(ST_Centroid(geom)) as centroid_lon
+   FROM counties WHERE name ILIKE 'Madison';
 
-2. Total/Sum queries (MUST use SUM aggregation):
-   SELECT SUM(ST_Area(geom::geography)/1000000) as total_area_km2 
-   FROM counties WHERE state_name = 'Texas';
-   
-3. List queries (counties in a state):
-   SELECT name FROM counties WHERE state_name = 'Texas' ORDER BY name;
-   SELECT name, state_name FROM counties WHERE state_abbr = 'TX' ORDER BY name;
-   NOTE: For "counties in [state]" questions, use WHERE state_name = '[State]' NOT spatial functions!
+3. Count county name occurrences - "How many counties are called Madison County?":
+   SELECT COUNT(*) as count FROM counties WHERE name ILIKE 'Madison';
 
-4. Largest/Smallest queries:
-   SELECT name, state_name, ST_Area(geom::geography)/1000000 as area_km2 
-   FROM counties ORDER BY area_km2 DESC LIMIT 5;
+4. Most frequent county names - "What are the three most frequent county names?":
+   SELECT name, COUNT(*) as count FROM counties GROUP BY name ORDER BY count DESC LIMIT 3;
 
-5. Filtered area queries:
-   SELECT name, state_name, ST_Area(geom::geography)/1000000 as area_km2 
-   FROM counties WHERE ST_Area(geom::geography)/1000000 > 10000 ORDER BY area_km2 DESC;
+5. Out-of-scope error - "Show me provinces in Canada":
+   DETECT: If question mentions non-US geography (Canada, provinces, etc.) → Return error message
 
-6. Adjacent counties (self-join):
-   SELECT DISTINCT c2.name, c2.state_name 
-   FROM counties c1, counties c2 
-   WHERE c1.name = 'Los Angeles' AND c1.state_name = 'California'
-     AND ST_Touches(c1.geom, c2.geom) 
-     AND (c2.name != c1.name OR c2.state_name != c1.state_name);
+6. List counties in state - "List all counties in Florida":
+   SELECT name, state_name FROM counties WHERE state_name ILIKE 'Florida' ORDER BY name;
 
-7. States bordering another state (self-join with state filtering):
-   SELECT DISTINCT c2.state_name, c2.state_abbr 
-   FROM counties c1, counties c2 
-   WHERE c1.state_name = 'Texas' 
-     AND ST_Touches(c1.geom, c2.geom) 
-     AND c2.state_abbr != c1.state_abbr 
-   ORDER BY c2.state_name;
-   NOTE: For "states bordering [state]" or "states adjacent to [state]" questions, use this pattern!
+7. List by abbreviation - "List all counties in WA":
+   SELECT name, state_name FROM counties WHERE state_abbr ILIKE 'WA' ORDER BY name;
 
-CRITICAL: For "total area" or "sum of area" questions, you MUST use SUM() aggregation function!
-DO NOT return individual rows - return a single aggregated result!
+-- PATTERN MATCHING --
+8. Starts with pattern - "Counties starting with 'San ' in California":
+   SELECT name, state_name FROM counties WHERE state_name ILIKE 'California' AND name ILIKE 'San %';
+
+9. Name equals state - "Counties whose name equals their state":
+   SELECT c.name, c.state_name FROM counties c WHERE LOWER(c.name) = LOWER(c.state_name);
+
+10. Multi-word names - "Counties with multi-word names in Minnesota":
+    SELECT name, state_name FROM counties WHERE state_name ILIKE 'Minnesota' AND name LIKE '% %';
+
+-- GEOGRAPHIC CONSTRAINTS --
+11. Counties touching another state - "Counties in California that touch Nevada":
+    SELECT DISTINCT c1.name, c1.state_name 
+    FROM counties c1, counties c2 
+    WHERE c1.state_name ILIKE 'California' AND c2.state_name ILIKE 'Nevada' 
+      AND ST_Touches(c1.geom, c2.geom);
+
+-- MEASUREMENTS --
+12. Land area of county - "Land area of Riverside County, California":
+    SELECT name, state_name, aland/1000000 as area_km2, aland*0.000000386102 as area_mi2
+    FROM counties WHERE name ILIKE 'Riverside' AND state_name ILIKE 'California';
+
+13. Rank by area - "Rank all counties in Arizona by area":
+    SELECT name, state_name, aland/1000000 as area_km2 
+    FROM counties WHERE state_name ILIKE 'Arizona' ORDER BY area_km2 DESC;
+
+14. Smallest county - "Which county in NC has the smallest area?":
+    SELECT name, state_name, aland/1000000 as area_km2 
+    FROM counties WHERE state_abbr ILIKE 'NC' AND aland > 0 ORDER BY area_km2 ASC LIMIT 1;
+
+15. Area filter - "Counties with area < 100 mi²":
+    SELECT name, state_name, aland*0.000000386102 as area_mi2 
+    FROM counties WHERE aland*0.000000386102 < 100 ORDER BY area_mi2 ASC;
+
+16. Perimeter length - "Perimeter of Orange County, California":
+    SELECT name, state_name, ST_Perimeter(geom::geography)/1000 as perimeter_km, ST_Perimeter(geom::geography)*0.000621371 as perimeter_mi
+    FROM counties WHERE name ILIKE 'Orange' AND state_name ILIKE 'California';
+
+17. Perimeter filter - "Counties in South Dakota with perimeter > 800 mi":
+    SELECT name, state_name, ST_Perimeter(geom::geography)*0.000621371 as perimeter_mi
+    FROM counties WHERE state_name ILIKE 'South Dakota' AND ST_Perimeter(geom::geography)*0.000621371 > 800;
+
+-- ADVANCED GEOMETRY --
+18. Interior rings (holes) - "Counties with holes in their geometry":
+    SELECT name, state_name, ST_NumInteriorRings((ST_Dump(geom)).geom) as num_holes
+    FROM counties WHERE ST_NumInteriorRings((ST_Dump(geom)).geom) > 0;
+
+19. Multipart polygons - "Counties that are non-contiguous MultiPolygons":
+    SELECT name, state_name, ST_NumGeometries(geom) as num_parts
+    FROM counties WHERE ST_NumGeometries(geom) > 1;
+
+20. Centroid outside polygon - "Counties whose centroid falls outside the polygon":
+    SELECT name, state_name 
+    FROM counties WHERE NOT ST_Within(ST_Centroid(geom), geom);
+
+21. Largest hole area - "For Ramsey County, MN, area of largest interior hole":
+    SELECT name, state_name, 
+           ST_Area((ST_InteriorRingN((ST_Dump(geom)).geom, 1))::geography)/1000000 as hole_area_km2
+    FROM counties WHERE name ILIKE 'Ramsey' AND state_abbr ILIKE 'MN';
+
+-- NEIGHBOR ANALYSIS --
+22. Count neighbors - "How many neighbors does Utah County, UT have?":
+    SELECT COUNT(DISTINCT c2.id) as neighbor_count
+    FROM counties c1, counties c2 
+    WHERE c1.name ILIKE 'Utah' AND c1.state_abbr ILIKE 'UT' 
+      AND ST_Touches(c1.geom, c2.geom) AND c1.id != c2.id;
+
+23. County with most neighbors - "Which county in AL has the most neighbors?":
+    SELECT c1.name, c1.state_name, COUNT(DISTINCT c2.id) as neighbor_count
+    FROM counties c1, counties c2 
+    WHERE c1.state_abbr ILIKE 'AL' AND ST_Touches(c1.geom, c2.geom) AND c1.id != c2.id
+    GROUP BY c1.id, c1.name, c1.state_name ORDER BY neighbor_count DESC LIMIT 1;
+
+24. Exact neighbor count - "Counties in CA with exactly two neighbors":
+    SELECT c1.name, c1.state_name, COUNT(DISTINCT c2.id) as neighbor_count
+    FROM counties c1, counties c2 
+    WHERE c1.state_abbr ILIKE 'CA' AND ST_Touches(c1.geom, c2.geom) AND c1.id != c2.id
+    GROUP BY c1.id, c1.name, c1.state_name HAVING COUNT(DISTINCT c2.id) = 2;
+
+-- STATE-LEVEL QUERIES --
+25. Largest state by area - "Which state has the largest area?" or "Largest state":
+    SELECT state_name, SUM(aland)/1000000 as total_area_km2 
+    FROM counties GROUP BY state_name ORDER BY total_area_km2 DESC LIMIT 1;
+
+26. Smallest state by area - "Which state has the smallest area?" or "Smallest state":
+    SELECT state_name, SUM(aland)/1000000 as total_area_km2 
+    FROM counties GROUP BY state_name ORDER BY total_area_km2 ASC LIMIT 1;
+
+27. State rankings - "Rank all states by area":
+    SELECT state_name, SUM(aland)/1000000 as total_area_km2 
+    FROM counties GROUP BY state_name ORDER BY total_area_km2 DESC;
+
+28. State with most counties - "Which state has the most counties?":
+    SELECT state_name, COUNT(*) as county_count 
+    FROM counties GROUP BY state_name ORDER BY county_count DESC LIMIT 1;
+
+CRITICAL: For queries asking to "show", "visualize", or "map", ALWAYS include geometry columns!
 CRITICAL: There is NO states table - use state_name/state_abbr columns from counties table!
 CRITICAL: For "counties in [state]" questions, use WHERE state_name = '[State]' NOT ST_Within or ST_Contains!
 """
@@ -524,6 +620,11 @@ def fix_sql_aggregation(sql: str, question: str) -> str:
     sql_upper = sql.upper()
     question_lower = question.lower()
     
+    # Check for out-of-scope queries (non-US geography)
+    out_of_scope_terms = ['canada', 'canadian', 'province', 'provinces', 'mexico', 'mexican', 'europe', 'asia', 'africa', 'australia', 'britain', 'england']
+    if any(term in question_lower for term in out_of_scope_terms):
+        return "SELECT 'ERROR: This database only contains US county data. Queries about Canada, provinces, or other non-US geography are out of scope.' as error_message"
+    
     # Check if question asks for total/sum but SQL doesn't have aggregation
     needs_sum = any(word in question_lower for word in ['total', 'sum', 'combined', 'all together', 'entire'])
     has_sum = 'SUM(' in sql_upper or 'SUM (' in sql_upper
@@ -796,6 +897,13 @@ def build_map_features(conn, rows: List[tuple], columns: List[str]) -> List[Dict
                 value = row_map[key]
                 if value is not None and value != '':
                     return value
+        # Try fuzzy matching if exact match fails
+        for key in keys:
+            for row_key in row_map:
+                if key in row_key or row_key in key:
+                    value = row_map[row_key]
+                    if value is not None and value != '':
+                        return value
         return None
 
     def to_float(value: Any) -> Optional[float]:
@@ -1242,14 +1350,34 @@ def convert_nl_to_sql(question: str) -> str:
     if any(pattern in question_lower for pattern in counties_in_state_patterns):
         state = extract_state_from_question(question)
         if state:
-            return f"SELECT name, state_name FROM counties WHERE state_name = '{state}' ORDER BY name"
+            return f"SELECT name, state_name, ST_AsGeoJSON(geom) as geom_geojson, ST_Y(ST_Centroid(geom)) as centroid_lat, ST_X(ST_Centroid(geom)) as centroid_lon FROM counties WHERE state_name = '{state}' ORDER BY name"
     
     prompt = f"""{SCHEMA_INFO}
 
     Question: {question}
 
     You are an expert SQL query generator for a PostGIS spatial database.
-    Given a natural language question, generate ONLY the SQL query without any explanation:"""
+    Given a natural language question, generate ONLY the SQL query without any explanation.
+    IMPORTANT: BORDER/NEIGHBOR QUERIES
+    - If the user asks for "bordering", "adjacent", "next to", "neighbors", "touching" of a county:
+    - YOU MUST USE A SELF-JOIN on the counties table!
+    - Pattern: SELECT c2.name, c2.state_name, ST_AsGeoJSON(c2.geom) as geom_geojson, ST_Y(ST_Centroid(c2.geom)) as centroid_lat, ST_X(ST_Centroid(c2.geom)) as centroid_lon FROM counties c1, counties c2 WHERE c1.name ILIKE '%[Target]%' AND ST_Touches(c1.geom, c2.geom) AND c1.id != c2.id
+    - NOTE: The 'name' column usually does NOT contain "County" (e.g. 'Los Angeles'). Use wildcards (e.g. '%Los Angeles%') or remove "County" from the target name.
+    
+    IMPORTANT: If the user asks to "show", "map", "visualize", or "display", YOU MUST SELECT GEOMETRY COLUMNS:
+    ST_AsGeoJSON(geom) as geom_geojson, ST_Y(ST_Centroid(geom)) as centroid_lat, ST_X(ST_Centroid(geom)) as centroid_lon
+    
+    IMPORTANT: Use ILIKE for string comparisons to be case-insensitive (e.g. state_name ILIKE 'california').
+    State names are stored as Title Case (e.g. 'California', 'New York').
+
+    IMPORTANT: AGGREGATION & MAPS
+    - If the user asks for "count", "how many", "total area", or "sum" for a region (e.g. "counties in California", "area of Texas"):
+    - DO NOT use COUNT() or SUM() in SQL!
+    - INSTEAD, SELECT the individual rows (name, state, area, geom) so they can be mapped!
+    - Python will calculate the total/count for you.
+    - Example: "How many counties in CA?" -> SELECT name, state_name, ST_AsGeoJSON(geom) as geom_geojson... FROM counties WHERE state_abbr='CA'
+    - Example: "Total area of Texas?" -> SELECT name, state_name, aland, ST_AsGeoJSON(geom) as geom_geojson... FROM counties WHERE state_name='Texas'
+    """
 
     try:
         # Try Ollama via HTTP API (for Railway deployment)
@@ -1271,18 +1399,16 @@ def convert_nl_to_sql(question: str) -> str:
             if response.status_code == 200:
                 result = response.json()
                 sql = result.get('response', '').strip()
-                # Clean up markdown formatting
+                # Clean up SQL (remove markdown code blocks if present)
                 sql = sql.replace('```sql', '').replace('```', '').strip()
-                if sql:
-                    # Post-process to fix aggregation issues
-                    sql = fix_sql_aggregation(sql, question)
-                    # Post-process to fix invalid table references
-                    sql = fix_invalid_table_references(sql, question)
-                    return sql
+                return sql
+            else:
+                print(f"Ollama error: {response.text}")
+                
         except Exception as e:
-            st.warning(f"Ollama not available: {e}")
-        
-        # Fallback to OpenAI if Ollama is not available
+            print(f"Ollama connection failed: {e}")
+            
+        # Fallback to OpenAI if Ollama fails or returns error
         openai_key = os.getenv('OPENAI_API_KEY')
         if openai_key:
             try:
@@ -1291,10 +1417,6 @@ def convert_nl_to_sql(question: str) -> str:
                 sql = response.content.strip()
                 sql = sql.replace('```sql', '').replace('```', '').strip()
                 if sql:
-                    # Post-process to fix aggregation issues
-                    sql = fix_sql_aggregation(sql, question)
-                    # Post-process to fix invalid table references
-                    sql = fix_invalid_table_references(sql, question)
                     return sql
             except Exception as e:
                 st.warning(f"OpenAI API error: {e}")
@@ -1312,18 +1434,84 @@ def convert_nl_to_sql(question: str) -> str:
                 return f"SELECT SUM(ST_Area(geom::geography)/1000000) as total_area_km2 FROM counties WHERE state_name = '{state}'"
             else:
                 return "SELECT SUM(ST_Area(geom::geography)/1000000) as total_area_km2 FROM counties"
+        elif 'state' in question_lower and ('largest' in question_lower or 'biggest' in question_lower):
+            # State-level query: largest state by total area
+            return "SELECT state_name, SUM(aland)/1000000 as total_area_km2 FROM counties GROUP BY state_name ORDER BY total_area_km2 DESC LIMIT 1"
+        elif 'state' in question_lower and 'smallest' in question_lower:
+            # State-level query: smallest state by total area
+            return "SELECT state_name, SUM(aland)/1000000 as total_area_km2 FROM counties GROUP BY state_name ORDER BY total_area_km2 ASC LIMIT 1"
         elif 'largest' in question_lower or 'biggest' in question_lower:
-            return "SELECT name, state_name, ST_Area(geom::geography)/1000000 as area_km2 FROM counties ORDER BY area_km2 DESC LIMIT 5"
+            # County-level query: largest counties
+            return "SELECT name, state_name, aland/1000000 as area_km2 FROM counties ORDER BY area_km2 DESC LIMIT 5"
         elif 'smallest' in question_lower:
-            return "SELECT name, state_name, ST_Area(geom::geography)/1000000 as area_km2 FROM counties WHERE ST_Area(geom::geography) > 0 ORDER BY area_km2 ASC LIMIT 5"
+            # County-level query: smallest counties
+            return "SELECT name, state_name, aland/1000000 as area_km2 FROM counties WHERE aland > 0 ORDER BY area_km2 ASC LIMIT 5"
         else:
             return "SELECT name, state_name FROM counties LIMIT 10"
-
     except Exception as e:
+        print(f"Error generating SQL: {e}")
         return f"SELECT COUNT(*) FROM counties LIMIT 1;"
 
+def synthesize_answer(question: str, sql_query: str, results: str) -> str:
+    """
+    Synthesize a natural language answer based on the question, SQL, and results.
+    Uses only the display data (no geometry) to ensure consistency with map.
+    """
+    # Get metadata from session state
+    metadata = st.session_state.get("query_metadata", {})
+    row_count = metadata.get("row_count", 0)
+    sample_data = metadata.get("sample_data", [])
+    
+    # Build a clean summary of the data
+    data_summary = f"Total rows: {row_count}\n"
+    if sample_data:
+        data_summary += f"Sample data (first {len(sample_data)} rows):\n"
+        for i, row in enumerate(sample_data, 1):
+            row_str = ", ".join([f"{k}: {v}" for k, v in row.items()])
+            data_summary += f"{i}. {row_str}\n"
+    
+    prompt = f"""
+    You are a helpful data assistant for a US Counties map application.
+    
+    User Question: {question}
+    Executed SQL: {sql_query}
+    Data Summary:
+    {data_summary}
+    
+    Please provide a clear, concise natural language answer to the user's question based on the data summary.
+    - If there are multiple rows, mention the count and list a few examples by name.
+    - If it's a single number or aggregate, state it clearly.
+    - If no data was found, explain that.
+    - Do NOT mention technical details like "MultiPolygon" or coordinates.
+    - Keep your answer brief and focused on what the user asked.
+    """
+    
+    try:
+        # Try Ollama via HTTP API
+        ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
+        
+        response = requests.post(
+            f"{ollama_url}/api/generate",
+            json={
+                "model": MODEL_NAME,
+                "prompt": prompt,
+                "stream": False,
+                "temperature": 0.3,
+            },
+            timeout=60
+        )
+        
+        if response.status_code == 200:
+            return response.json().get('response', '').strip()
+            
+    except Exception as e:
+        print(f"Synthesis error: {e}")
+        
+    # Fallback if synthesis fails
+    return f"Here are the results:\n{results}"
+
 @tool
-def execute_sql_query(sql_query: str) -> str:
+def execute_sql_query(sql_query: str, user_question: str = "") -> str:
     """
     Execute a SQL query against the US counties database and return the results.
     
@@ -1387,16 +1575,71 @@ def execute_sql_query(sql_query: str) -> str:
                 if isinstance(value, (int, float)):
                     return f"**Minimum:** {value:,.2f}"
             
+            # Fallback: If we have a result but no map features, try to fetch them for the state
+            if not st.session_state.get("map_features"):
+                 state = extract_state_from_question(user_question)
+                 if state:
+                     try:
+                         map_query = f"SELECT name, state_name, ST_AsGeoJSON(geom) as geom_geojson, ST_Y(ST_Centroid(geom)) as centroid_lat, ST_X(ST_Centroid(geom)) as centroid_lon FROM counties WHERE state_name = '{state}'"
+                         cur.execute(map_query)
+                         map_rows = cur.fetchall()
+                         map_cols = [desc[0] for desc in cur.description]
+                         st.session_state["map_features"] = build_map_features(map_rows, map_cols)
+                     except Exception as e:
+                         print(f"Fallback map fetch failed: {e}")
+
             # Default single value format
             return f"**Result:** {value}"
 
         result_text = f"**Found {len(rows)} result(s):**\n\n"
 
+        # Python-side Aggregation Logic
+        question_lower = user_question.lower()
+        if len(rows) > 1:
+            if "count" in question_lower or "how many" in question_lower:
+                result_text = f"**Count:** {len(rows)}\n\n" + result_text
+            elif "area" in question_lower and ("total" in question_lower or "sum" in question_lower):
+                # Try to find an area column
+                area_col_idx = -1
+                for idx, col in enumerate(columns):
+                    if "area" in col.lower() or "aland" in col.lower():
+                        area_col_idx = idx
+                        break
+                
+                if area_col_idx != -1:
+                    try:
+                        total_area = sum(float(row[area_col_idx]) for row in rows if row[area_col_idx] is not None)
+                        # Convert sq meters to sq km if needed (aland is usually sq meters)
+                        # Assuming aland is sq meters, divide by 1,000,000 for sq km
+                        if "aland" in columns[area_col_idx].lower():
+                             total_area_km = total_area / 1_000_000
+                             result_text = f"**Total Area:** {total_area_km:,.2f} km²\n\n" + result_text
+                        else:
+                             result_text = f"**Total Area:** {total_area:,.2f}\n\n" + result_text
+                    except Exception as e:
+                        print(f"Error calculating area: {e}")
+
+        # Columns to exclude from text output (but keep for map)
+        exclude_cols = ['geom', 'geometry', 'geom_geojson', 'centroid_lat', 'centroid_lon', 'st_asgeojson', 'st_y', 'st_x']
+        
+        # Filter columns for display
+        display_indices = [i for i, col in enumerate(columns) if col.lower() not in exclude_cols]
+        display_columns = [columns[i] for i in display_indices]
+
+        # Build clean sample data for synthesis (without geometry)
+        sample_rows = []
+        for row in rows[:10]:
+            clean_row = {display_columns[i]: row[display_indices[i]] for i in range(len(display_columns))}
+            sample_rows.append(clean_row)
+
         for i, row in enumerate(rows[:10], 1):  
-            if len(columns) == 1:
-                result_text += f"{i}. {row[0]}\n"
+            if len(display_columns) == 0:
+                 # If all columns are hidden (e.g. just asked for map), show name if available or generic message
+                 result_text += f"{i}. [Map Data]\n"
+            elif len(display_columns) == 1:
+                result_text += f"{i}. {row[display_indices[0]]}\n"
             else:
-                row_data = ", ".join([f"{col}: {val}" for col, val in zip(columns, row)])
+                row_data = ", ".join([f"{col}: {row[idx]}" for idx, col in zip(display_indices, display_columns)])
                 result_text += f"{i}. {row_data}\n"
 
         if len(rows) > 10:
@@ -1407,6 +1650,13 @@ def execute_sql_query(sql_query: str) -> str:
             st.session_state["map_features"] = map_features
         except Exception:
             st.session_state["map_features"] = []
+
+        # Store metadata for synthesis
+        st.session_state["query_metadata"] = {
+            "row_count": len(rows),
+            "display_columns": display_columns,
+            "sample_data": sample_rows
+        }
 
         cur.close()
         conn.close()
@@ -1441,9 +1691,9 @@ def create_agent():
             sql_query = convert_nl_to_sql.invoke({"question": question})
             
             # Step 2: Execute the SQL query
-            results = execute_sql_query.invoke({"sql_query": sql_query})
+            results = execute_sql_query.invoke({"sql_query": sql_query, "user_question": question})
             
-            # Step 3: Format the response
+            # Step 3: Format the response (raw database results)
             response = f"""I'll help you answer that question about US counties.
 
 **Generated SQL Query:**
@@ -1476,6 +1726,9 @@ def get_agent():
 def run_agent(question: str) -> str:
     """Run the agent with a user question and return the response"""
     try:
+        # Clear previous map features
+        st.session_state["map_features"] = []
+        
         agent = get_agent()
         return agent(question)
     except Exception as e:
